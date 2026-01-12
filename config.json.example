@@ -1,0 +1,13 @@
+// Example configuration file for atlogin.
+// Copy this file to ~/.atlogin/config.json and edit as needed.
+{
+	// Address to listen on. Default: ":9411"
+	"addr": ":9411",
+
+	// Issuer URL for OIDC discovery. Must match what clients expect.
+	"issuer": "https://at.apenwarr.ca",
+
+	// OIDC client credentials. These must match what your relying party uses.
+	"clientId": "your-client-id",
+	"clientSecret": "your-client-secret",
+}
