@@ -27,8 +27,9 @@ import (
 )
 
 var (
-	flagStateDir  = flag.String("state-dir", "", "state directory (default: ~/.atlogin)")
+	flagStateDir  = flag.String("state-dir", "./state", "state directory")
 	flagNewClient = flag.String("new-client", "", "add a new client ID and generate a secret for it")
+	flagInit      = flag.Bool("init", false, "initialize state directory and all key files, then exit")
 )
 
 const (
@@ -48,25 +49,34 @@ func main() {
 	flag.Parse()
 
 	stateDir := *flagStateDir
-	if stateDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			log.Fatalf("cannot determine home directory: %v", err)
-		}
-		stateDir = filepath.Join(home, ".atlogin")
-	}
 
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		log.Fatalf("cannot create state directory: %v", err)
 	}
 
 	configPath := filepath.Join(stateDir, "config.json")
+	keyFile := filepath.Join(stateDir, "signing-key.json")
 
 	// Handle -new-client flag
 	if *flagNewClient != "" {
 		if err := addNewClient(configPath, *flagNewClient); err != nil {
 			log.Fatal(err)
 		}
+		return
+	}
+
+	// Always ensure signing key exists
+	if err := ensureSigningKey(keyFile); err != nil {
+		log.Fatalf("cannot initialize signing key: %v", err)
+	}
+
+	// Handle -init flag
+	if *flagInit {
+		// Ensure config file exists with empty secrets
+		if err := ensureConfig(configPath); err != nil {
+			log.Fatalf("cannot initialize config: %v", err)
+		}
+		log.Printf("Initialized state directory: %s", stateDir)
 		return
 	}
 
@@ -92,7 +102,7 @@ func main() {
 	srv := &idpServer{
 		issuer:       issuer,
 		secrets:      config.Secrets,
-		keyFile:      filepath.Join(stateDir, "signing-key.json"),
+		keyFile:      keyFile,
 		codes:        make(map[string]*authRequest),
 		accessTokens: make(map[string]*authRequest),
 	}
@@ -127,6 +137,35 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+func ensureConfig(configPath string) error {
+	if _, err := os.Stat(configPath); err == nil {
+		return nil // already exists
+	}
+	config := &Config{Secrets: make(map[string]string)}
+	data, err := json.MarshalIndent(config, "", "\t")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(configPath, data, 0600)
+}
+
+func ensureSigningKey(keyFile string) error {
+	if _, err := os.Stat(keyFile); err == nil {
+		return nil // already exists
+	}
+	kid, k, err := genRSAKey(2048)
+	if err != nil {
+		return err
+	}
+	sk := &signingKey{k: k, kid: kid}
+	data, err := sk.MarshalJSON()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(keyFile, data, 0600)
 }
 
 func addNewClient(configPath, clientID string) error {

@@ -10,5 +10,5 @@ RUN go build -v -o /run-app ./cmd/atlogin
 
 FROM debian:bookworm
 
-COPY --from=builder /run-app /usr/local/bin/
-CMD ["run-app"]
+COPY --from=builder /run-app /
+CMD ["/run-app", "-state-dir=/state"]
