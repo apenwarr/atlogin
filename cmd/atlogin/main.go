@@ -57,6 +57,14 @@ func main() {
 	configPath := filepath.Join(stateDir, "config.json")
 	keyFile := filepath.Join(stateDir, "signing-key.json")
 
+	// Write files from environment variables if set (for fly.io secrets)
+	if err := writeFromEnv("ATLOGIN_CONFIG", configPath); err != nil {
+		log.Fatalf("cannot write config from ATLOGIN_CONFIG: %v", err)
+	}
+	if err := writeFromEnv("ATLOGIN_SIGNING_KEY", keyFile); err != nil {
+		log.Fatalf("cannot write signing key from ATLOGIN_SIGNING_KEY: %v", err)
+	}
+
 	// Handle -new-client flag
 	if *flagNewClient != "" {
 		if err := addNewClient(configPath, *flagNewClient); err != nil {
@@ -150,6 +158,20 @@ func ensureConfig(configPath string) error {
 	}
 	data = append(data, '\n')
 	return os.WriteFile(configPath, data, 0600)
+}
+
+// writeFromEnv writes the base64-decoded contents of an environment variable to a file.
+// If the environment variable is not set, it does nothing.
+func writeFromEnv(envVar, filePath string) error {
+	value := os.Getenv(envVar)
+	if value == "" {
+		return nil
+	}
+	data, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return fmt.Errorf("invalid base64 in %s: %v", envVar, err)
+	}
+	return os.WriteFile(filePath, data, 0600)
 }
 
 func ensureSigningKey(keyFile string) error {
