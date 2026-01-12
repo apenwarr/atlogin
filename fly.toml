@@ -21,6 +21,13 @@ primary_region = 'arn'
   min_machines_running = 0
   processes = ['app']
 
+[[http_service.checks]]
+  grace_period = "5s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/"
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'

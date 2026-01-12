@@ -116,6 +116,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/{$}", serveRoot)
 	mux.HandleFunc("/.well-known/webfinger", srv.serveWebFinger)
 	mux.HandleFunc("/.well-known/openid-configuration", srv.serveOpenIDConfig)
 	mux.HandleFunc("/.well-known/jwks.json", srv.serveJWKS)
@@ -145,6 +146,11 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+func serveRoot(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	io.WriteString(w, "Hello, this is the atlogin server.\n")
 }
 
 func ensureConfig(configPath string) error {
