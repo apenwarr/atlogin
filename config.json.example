@@ -7,7 +7,7 @@
 	// Issuer URL for OIDC discovery. Must match what clients expect.
 	"issuer": "https://at.apenwarr.ca",
 
-	// OIDC client credentials. These must match what your relying party uses.
-	"clientId": "your-client-id",
-	"clientSecret": "your-client-secret",
+	// OIDC client credentials. Map of client ID to client secret.
+	// Add new clients with: atlogin -new-client <client-id>
+	"secrets": {},
 }

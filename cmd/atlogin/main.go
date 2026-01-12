@@ -27,7 +27,8 @@ import (
 )
 
 var (
-	flagStateDir = flag.String("state-dir", "", "state directory (default: ~/.atlogin)")
+	flagStateDir  = flag.String("state-dir", "", "state directory (default: ~/.atlogin)")
+	flagNewClient = flag.String("new-client", "", "add a new client ID and generate a secret for it")
 )
 
 const (
@@ -38,10 +39,9 @@ const (
 
 // Config represents the configuration file structure.
 type Config struct {
-	Addr         string `json:"addr"`
-	Issuer       string `json:"issuer"`
-	ClientID     string `json:"clientId"`
-	ClientSecret string `json:"clientSecret"`
+	Addr    string            `json:"addr,omitempty"`
+	Issuer  string            `json:"issuer,omitempty"`
+	Secrets map[string]string `json:"secrets"`
 }
 
 func main() {
@@ -61,24 +61,22 @@ func main() {
 	}
 
 	configPath := filepath.Join(stateDir, "config.json")
-	configData, err := os.ReadFile(configPath)
+
+	// Handle -new-client flag
+	if *flagNewClient != "" {
+		if err := addNewClient(configPath, *flagNewClient); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	config, err := loadConfig(configPath)
 	if err != nil {
-		log.Fatalf("cannot read config file %s: %v", configPath, err)
+		log.Fatal(err)
 	}
 
-	// Parse hujson (JSON with comments and trailing commas)
-	configData, err = hujson.Standardize(configData)
-	if err != nil {
-		log.Fatalf("cannot parse config file %s: %v", configPath, err)
-	}
-
-	var config Config
-	if err := json.Unmarshal(configData, &config); err != nil {
-		log.Fatalf("cannot parse config file %s: %v", configPath, err)
-	}
-
-	if config.ClientID == "" || config.ClientSecret == "" {
-		log.Fatal("config must specify clientId and clientSecret")
+	if len(config.Secrets) == 0 {
+		log.Fatal("config must have at least one client in secrets")
 	}
 
 	addr := config.Addr
@@ -93,8 +91,7 @@ func main() {
 
 	srv := &idpServer{
 		issuer:       issuer,
-		clientID:     config.ClientID,
-		clientSecret: config.ClientSecret,
+		secrets:      config.Secrets,
 		keyFile:      filepath.Join(stateDir, "signing-key.json"),
 		codes:        make(map[string]*authRequest),
 		accessTokens: make(map[string]*authRequest),
@@ -112,11 +109,68 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
 
+func loadConfig(configPath string) (*Config, error) {
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read config file %s: %v", configPath, err)
+	}
+
+	// Parse hujson (JSON with comments and trailing commas)
+	configData, err = hujson.Standardize(configData)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse config file %s: %v", configPath, err)
+	}
+
+	var config Config
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return nil, fmt.Errorf("cannot parse config file %s: %v", configPath, err)
+	}
+
+	return &config, nil
+}
+
+func addNewClient(configPath, clientID string) error {
+	config, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	if config.Secrets == nil {
+		config.Secrets = make(map[string]string)
+	}
+
+	if _, exists := config.Secrets[clientID]; exists {
+		return fmt.Errorf("client %q already exists", clientID)
+	}
+
+	secret := randomHex(32)
+	config.Secrets[clientID] = secret
+
+	// Write config atomically
+	data, err := json.MarshalIndent(config, "", "\t")
+	if err != nil {
+		return fmt.Errorf("cannot marshal config: %v", err)
+	}
+	data = append(data, '\n')
+
+	tmpFile := configPath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+		return fmt.Errorf("cannot write temp config file: %v", err)
+	}
+	if err := os.Rename(tmpFile, configPath); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("cannot rename config file: %v", err)
+	}
+
+	// Print secret to stdout (only non-stderr output)
+	fmt.Println(secret)
+	return nil
+}
+
 type idpServer struct {
-	issuer       string
-	clientID     string
-	clientSecret string
-	keyFile      string
+	issuer  string
+	secrets map[string]string // clientID -> clientSecret
+	keyFile string
 
 	mu           sync.Mutex
 	signingKey   *signingKey
@@ -125,6 +179,7 @@ type idpServer struct {
 }
 
 type authRequest struct {
+	clientID    string
 	nonce       string
 	redirectURI string
 	validTill   time.Time
@@ -253,7 +308,7 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	clientID := q.Get("client_id")
-	if clientID != s.clientID {
+	if _, ok := s.secrets[clientID]; !ok {
 		http.Error(w, "invalid client_id", http.StatusBadRequest)
 		return
 	}
@@ -267,6 +322,7 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	code := randomHex(32)
 	s.mu.Lock()
 	s.codes[code] = &authRequest{
+		clientID:    clientID,
 		nonce:       q.Get("nonce"),
 		redirectURI: redirectURI,
 	}
@@ -295,7 +351,8 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		clientID = r.FormValue("client_id")
 		clientSecret = r.FormValue("client_secret")
 	}
-	if clientID != s.clientID || clientSecret != s.clientSecret {
+	expectedSecret, ok := s.secrets[clientID]
+	if !ok || clientSecret != expectedSecret {
 		http.Error(w, "invalid client credentials", http.StatusUnauthorized)
 		return
 	}
@@ -318,6 +375,11 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ar.clientID != clientID {
+		http.Error(w, "client_id mismatch", http.StatusBadRequest)
+		return
+	}
+
 	if ar.redirectURI != r.FormValue("redirect_uri") {
 		http.Error(w, "redirect_uri mismatch", http.StatusBadRequest)
 		return
@@ -333,7 +395,7 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 	claims := map[string]any{
 		"iss":   s.issuer,
 		"sub":   userSub,
-		"aud":   s.clientID,
+		"aud":   clientID,
 		"exp":   now.Add(time.Hour).Unix(),
 		"iat":   now.Unix(),
 		"name":  userName,
