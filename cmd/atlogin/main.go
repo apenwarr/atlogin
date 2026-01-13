@@ -1,6 +1,7 @@
 // Command atlogin is an OIDC Identity Provider that uses ATProto OAuth for authentication.
-// Users authenticate using their ATProto handle (e.g., hello.example.com@at.apenwarr.ca),
+// Users authenticate using their ATProto handle with any domain (e.g., hello.example.com@any.domain),
 // which initiates an OAuth flow with their PDS (Personal Data Server).
+// The provider accepts any domain and authenticates the ATProto handle, returning the full email as provided.
 package main
 
 import (
@@ -278,6 +279,7 @@ type atprotoSession struct {
 	handle      string
 	did         string
 	email       string
+	domain      string // Original domain from login_hint (e.g., "any.domain")
 	clientID    string
 	redirectURI string
 	nonce       string
@@ -490,16 +492,16 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract ATProto handle from login_hint parameter
-	// Expected format: hello.example.com@at.apenwarr.ca
+	// Extract ATProto handle and domain from login_hint parameter
+	// Expected format: hello.example.com@any.domain
 	loginHint := q.Get("login_hint")
 	if loginHint == "" {
-		http.Error(w, "missing login_hint parameter (expected format: handle@at.apenwarr.ca)", http.StatusBadRequest)
+		http.Error(w, "missing login_hint parameter (expected format: handle@domain)", http.StatusBadRequest)
 		return
 	}
 
-	// Parse the login hint to extract the ATProto handle
-	handle, err := parseLoginHint(loginHint)
+	// Parse the login hint to extract the ATProto handle and domain
+	handle, domain, err := parseLoginHint(loginHint)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("invalid login_hint format: %v", err), http.StatusBadRequest)
 		return
@@ -526,6 +528,7 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Store the OIDC request info mapped to the ATProto state
 	s.store.oidcSessions[atprotoState] = &atprotoSession{
 		handle:      handle,
+		domain:      domain, // Store the original domain from login_hint
 		clientID:    clientID,
 		redirectURI: redirectURI,
 		nonce:       q.Get("nonce"),
@@ -538,27 +541,27 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, atprotoRedirectURL, http.StatusFound)
 }
 
-// parseLoginHint extracts the ATProto handle from a login hint in the format:
-// handle@at.apenwarr.ca -> handle
-func parseLoginHint(loginHint string) (string, error) {
+// parseLoginHint extracts the ATProto handle and domain from a login hint in the format:
+// handle@any.domain -> (handle, any.domain)
+// We accept any domain and will service it as an authoritative login provider.
+func parseLoginHint(loginHint string) (string, string, error) {
 	parts := strings.SplitN(loginHint, "@", 2)
 	if len(parts) != 2 {
-		return "", fmt.Errorf("expected format: handle@at.apenwarr.ca, got: %s", loginHint)
+		return "", "", fmt.Errorf("expected format: handle@domain, got: %s", loginHint)
 	}
 
 	handle := parts[0]
 	domain := parts[1]
 
-	// Verify the domain is at.apenwarr.ca
-	if domain != "at.apenwarr.ca" {
-		return "", fmt.Errorf("expected domain at.apenwarr.ca, got: %s", domain)
-	}
-
 	if handle == "" {
-		return "", fmt.Errorf("handle cannot be empty")
+		return "", "", fmt.Errorf("handle cannot be empty")
 	}
 
-	return handle, nil
+	if domain == "" {
+		return "", "", fmt.Errorf("domain cannot be empty")
+	}
+
+	return handle, domain, nil
 }
 
 func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
@@ -810,9 +813,9 @@ func (s *idpServer) serveATProtoCallback(w http.ResponseWriter, r *http.Request)
 	matchedSession.did = authenticatedDID
 
 	// Construct email to match the original login_hint format
-	// User logged in as "handle@at.apenwarr.ca", so we return "handle@at.apenwarr.ca"
+	// User logged in as "handle@domain", so we return "handle@domain"
 	if matchedSession.email == "" {
-		matchedSession.email = matchedSession.handle + "@at.apenwarr.ca"
+		matchedSession.email = matchedSession.handle + "@" + matchedSession.domain
 	}
 	s.store.mu.Unlock()
 
