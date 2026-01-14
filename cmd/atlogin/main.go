@@ -585,27 +585,53 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, atprotoRedirectURL, http.StatusFound)
 }
 
-// parseLoginHint extracts the ATProto handle and domain from a login hint in the format:
-// handle@any.domain -> (handle, any.domain)
-// We accept any domain and will service it as an authoritative login provider.
+// parseLoginHint extracts the ATProto handle and domain from a login hint.
+//
+// Format: user@domain
+//
+// ATProto handle rules:
+// 1. Default: user@domain -> @user.domain (ATProto handle), domain (webfinger domain)
+// 2. If "user." is a prefix of domain: user@user.example.com -> @user.example.com, user.example.com
+// 3. Special case for at.apenwarr.ca: user@at.apenwarr.ca -> @user, at.apenwarr.ca
+//
+// Examples:
+//   - at@apenwarr.ca -> @at.apenwarr.ca (handle), apenwarr.ca (domain)
+//   - apenwarr@apenwarr.ca -> @apenwarr.ca (handle), apenwarr.ca (domain)
+//   - user@at.apenwarr.ca -> @user (handle), at.apenwarr.ca (domain) [backward compat]
+//
+// Returns: (atprotoHandle, webfingerDomain, error)
 func parseLoginHint(loginHint string) (string, string, error) {
 	parts := strings.SplitN(loginHint, "@", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("expected format: handle@domain, got: %s", loginHint)
+		return "", "", fmt.Errorf("expected format: user@domain, got: %s", loginHint)
 	}
 
-	handle := parts[0]
+	user := parts[0]
 	domain := parts[1]
 
-	if handle == "" {
-		return "", "", fmt.Errorf("handle cannot be empty")
+	if user == "" {
+		return "", "", fmt.Errorf("user cannot be empty")
 	}
 
 	if domain == "" {
 		return "", "", fmt.Errorf("domain cannot be empty")
 	}
 
-	return handle, domain, nil
+	// Special case for backward compatibility with at.apenwarr.ca
+	if domain == "at.apenwarr.ca" {
+		return user, domain, nil
+	}
+
+	// Check if "user." is a prefix of domain
+	prefix := user + "."
+	if strings.HasPrefix(domain, prefix) {
+		// user@user.example.com -> @user.example.com
+		return domain, domain, nil
+	}
+
+	// Default case: user@domain -> @user.domain
+	atprotoHandle := user + "." + domain
+	return atprotoHandle, domain, nil
 }
 
 func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
