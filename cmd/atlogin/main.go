@@ -142,6 +142,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/{$}", serveRoot)
 	mux.HandleFunc("/.well-known/webfinger", srv.serveWebFinger)
+	mux.HandleFunc("/helpers/webfinger", srv.serveWebFinger) // Stable helper endpoint for reverse proxying
 	mux.HandleFunc("/.well-known/openid-configuration", srv.serveOpenIDConfig)
 	mux.HandleFunc("/.well-known/jwks.json", srv.serveJWKS)
 	mux.HandleFunc("/authorize", srv.serveAuthorize)

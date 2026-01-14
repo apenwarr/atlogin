@@ -359,7 +359,16 @@ var verifyTemplate = template.Must(template.New("verify").Parse(`<!DOCTYPE html>
 
         {{if not .HasWebFinger}}
         <h3>WebFinger Setup</h3>
-        <p>Create a file at <code>/.well-known/webfinger</code> on your domain with this content:</p>
+        <p><strong>Important:</strong> The WebFinger endpoint must be <strong>dynamically generated</strong> to support all email addresses at your domain. It cannot be a static file.</p>
+
+        <p>Your server needs to handle requests to <code>/.well-known/webfinger</code> and:</p>
+        <ol>
+            <li>Read the <code>resource</code> query parameter (e.g., <code>?resource=acct:user@{{.Domain}}</code>)</li>
+            <li>Return JSON with that resource as the subject</li>
+            <li>Include the OIDC issuer link pointing to {{.ExpectedIssuer}}</li>
+        </ol>
+
+        <p>Example for <code>{{.Email}}</code>:</p>
         <pre>{
   "subject": "acct:{{.Email}}",
   "links": [
@@ -369,8 +378,27 @@ var verifyTemplate = template.Must(template.New("verify").Parse(`<!DOCTYPE html>
     }
   ]
 }</pre>
-        <p>This file should be served with <code>Content-Type: application/jrd+json</code></p>
-        <p>The WebFinger endpoint should accept a <code>resource</code> query parameter and return information about that resource.</p>
+
+        <p><strong>Quick Solution (Recommended):</strong> Use a reverse proxy to forward WebFinger requests to the atlogin server:</p>
+
+        <h4>Nginx Configuration:</h4>
+        <pre>location /.well-known/webfinger {
+    proxy_pass {{.ExpectedIssuer}}/helpers/webfinger;
+    proxy_set_header Host $host;
+}</pre>
+
+        <h4>Apache Configuration:</h4>
+        <pre>ProxyPass /.well-known/webfinger {{.ExpectedIssuer}}/helpers/webfinger
+ProxyPassReverse /.well-known/webfinger {{.ExpectedIssuer}}/helpers/webfinger</pre>
+
+        <h4>Caddy Configuration:</h4>
+        <pre>reverse_proxy /.well-known/webfinger {{.ExpectedIssuer}}/helpers/webfinger</pre>
+
+        <p>This forwards all WebFinger requests from <a href="https://{{.Domain}}/.well-known/webfinger?resource=acct:{{.Email}}">https://{{.Domain}}/.well-known/webfinger?resource=...</a> to <a href="{{.ExpectedIssuer}}/helpers/webfinger?resource=acct:{{.Email}}">{{.ExpectedIssuer}}/helpers/webfinger?resource=...</a></p>
+
+        <p>Click these links to test your setup once configured.</p>
+
+        <p>If implementing your own endpoint, serve it with <code>Content-Type: application/jrd+json</code></p>
         {{end}}
 
         {{if and .HasWebFinger (not .Issuer)}}
