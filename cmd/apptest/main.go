@@ -13,6 +13,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -66,6 +67,29 @@ type userInfo struct {
 	Email string `json:"email"`
 }
 
+type webFingerResponse struct {
+	Subject string                   `json:"subject"`
+	Links   []webFingerLink          `json:"links"`
+}
+
+type webFingerLink struct {
+	Rel  string `json:"rel"`
+	Href string `json:"href"`
+}
+
+type verificationResult struct {
+	Domain         string
+	Email          string
+	HasDNS         bool
+	HasHTTPS       bool
+	HasWebFinger   bool
+	WebFinger      *webFingerResponse
+	Issuer         string
+	ExpectedIssuer string
+	Errors         []string
+	Warnings       []string
+}
+
 func main() {
 	flag.Parse()
 
@@ -85,6 +109,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/{$}", srv.serveHome)
+	mux.HandleFunc("/verify", srv.serveVerify)
 	mux.HandleFunc("/login", srv.serveLogin)
 	mux.HandleFunc("/callback", srv.serveCallback)
 
@@ -147,13 +172,233 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
     <h1>ATLogin Test App</h1>
     <p>Enter your desired email address to test the ATLogin OIDC flow.</p>
 
-    <form action="/login" method="post">
+    <form action="/verify" method="post">
         <label for="email">Email Address:</label>
         <input type="email" id="email" name="email" required
                placeholder="apenwarr.ca@at.apenwarr.ca">
         <div class="help">Format: handle@domain (e.g., apenwarr.ca@at.apenwarr.ca)</div>
         <button type="submit">Log In with ATLogin</button>
     </form>
+</body>
+</html>
+`))
+
+var verifyTemplate = template.Must(template.New("verify").Parse(`<!DOCTYPE html>
+<html>
+<head>
+    <title>Domain Verification - ATLogin Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        .status {
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        .success {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .warning {
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            color: #856404;
+        }
+        .section {
+            margin: 20px 0;
+        }
+        .section h2 {
+            color: #555;
+            border-bottom: 2px solid #ddd;
+            padding-bottom: 5px;
+        }
+        pre {
+            background-color: #f5f5f5;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 15px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .button {
+            display: inline-block;
+            margin-top: 10px;
+            margin-right: 10px;
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .button:hover {
+            background-color: #0056b3;
+        }
+        .button-secondary {
+            background-color: #6c757d;
+        }
+        .button-secondary:hover {
+            background-color: #545b62;
+        }
+        ul {
+            margin: 10px 0;
+        }
+        li {
+            margin: 5px 0;
+        }
+        .check-item {
+            margin: 10px 0;
+        }
+        .check-pass::before {
+            content: "✓ ";
+            color: #28a745;
+            font-weight: bold;
+        }
+        .check-fail::before {
+            content: "✗ ";
+            color: #dc3545;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Domain Verification</h1>
+
+    {{if .Errors}}
+    <div class="status error">
+        <strong>Verification Failed</strong>
+        <ul>
+        {{range .Errors}}
+            <li>{{.}}</li>
+        {{end}}
+        </ul>
+    </div>
+    {{else}}
+    <div class="status success">
+        <strong>Domain Verified!</strong> Your domain is properly configured for Tailscale ATLogin.
+    </div>
+    {{end}}
+
+    {{if .Warnings}}
+    <div class="status warning">
+        <strong>Warnings:</strong>
+        <ul>
+        {{range .Warnings}}
+            <li>{{.}}</li>
+        {{end}}
+        </ul>
+    </div>
+    {{end}}
+
+    <div class="section">
+        <h2>Verification Checks</h2>
+        <div class="check-item {{if .HasDNS}}check-pass{{else}}check-fail{{end}}">
+            DNS resolution for {{.Domain}}
+        </div>
+        <div class="check-item {{if .HasHTTPS}}check-pass{{else}}check-fail{{end}}">
+            HTTPS connectivity to {{.Domain}}
+        </div>
+        <div class="check-item {{if .HasWebFinger}}check-pass{{else}}check-fail{{end}}">
+            WebFinger endpoint (/.well-known/webfinger)
+        </div>
+        {{if .HasWebFinger}}
+        <div class="check-item {{if .Issuer}}check-pass{{else}}check-fail{{end}}">
+            OIDC issuer link in WebFinger
+        </div>
+        {{end}}
+    </div>
+
+    {{if .WebFinger}}
+    <div class="section">
+        <h2>WebFinger Response</h2>
+        <pre>{{.WebFingerJSON}}</pre>
+    </div>
+    {{end}}
+
+    {{if .Issuer}}
+    <div class="section">
+        <h2>Detected OIDC Issuer</h2>
+        <p><strong>{{.Issuer}}</strong></p>
+    </div>
+    {{end}}
+
+    {{if .Errors}}
+    <div class="section">
+        <h2>How to Fix</h2>
+
+        {{if not .HasDNS}}
+        <h3>DNS Setup</h3>
+        <p>The domain <strong>{{.Domain}}</strong> does not have a DNS entry. Add an A or CNAME record pointing to your server.</p>
+        {{end}}
+
+        {{if not .HasHTTPS}}
+        <h3>HTTPS Setup</h3>
+        <p>Could not connect to <strong>https://{{.Domain}}</strong>. Make sure:</p>
+        <ul>
+            <li>Your server is running and accessible on port 443</li>
+            <li>You have a valid SSL/TLS certificate</li>
+            <li>Firewall rules allow HTTPS traffic</li>
+        </ul>
+        {{end}}
+
+        {{if not .HasWebFinger}}
+        <h3>WebFinger Setup</h3>
+        <p>Create a file at <code>/.well-known/webfinger</code> on your domain with this content:</p>
+        <pre>{
+  "subject": "acct:{{.Email}}",
+  "links": [
+    {
+      "rel": "http://openid.net/specs/connect/1.0/issuer",
+      "href": "{{.ExpectedIssuer}}"
+    }
+  ]
+}</pre>
+        <p>This file should be served with <code>Content-Type: application/jrd+json</code></p>
+        <p>The WebFinger endpoint should accept a <code>resource</code> query parameter and return information about that resource.</p>
+        {{end}}
+
+        {{if and .HasWebFinger (not .Issuer)}}
+        <h3>OIDC Issuer Missing</h3>
+        <p>Your WebFinger response is missing the OIDC issuer link. Make sure your WebFinger response includes:</p>
+        <pre>{
+  "links": [
+    {
+      "rel": "http://openid.net/specs/connect/1.0/issuer",
+      "href": "{{.ExpectedIssuer}}"
+    }
+  ]
+}</pre>
+        {{end}}
+    </div>
+    {{end}}
+
+    <div class="section">
+        <form action="/login" method="post" style="display: inline;">
+            <input type="hidden" name="email" value="{{.Email}}">
+            {{if not .Errors}}
+            <button type="submit" class="button">Continue to Login</button>
+            {{else}}
+            <button type="submit" class="button" disabled title="Fix the errors above before continuing">Continue to Login</button>
+            {{end}}
+        </form>
+        <a href="/" class="button button-secondary">Start Over</a>
+    </div>
 </body>
 </html>
 `))
@@ -472,6 +717,127 @@ func (s *server) getUserInfo(ctx context.Context, userinfoEndpoint, accessToken 
 	}
 
 	return &info, nil
+}
+
+func (s *server) serveVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	email := r.FormValue("email")
+	if email == "" {
+		http.Error(w, "Email is required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse email to extract domain
+	parts := strings.SplitN(email, "@", 2)
+	if len(parts) != 2 {
+		http.Error(w, "Invalid email format", http.StatusBadRequest)
+		return
+	}
+	domain := parts[1]
+
+	// Verify the domain
+	result := s.verifyDomain(r.Context(), domain, email)
+
+	// Pretty-print WebFinger JSON
+	var webFingerJSON string
+	if result.WebFinger != nil {
+		data, _ := json.MarshalIndent(result.WebFinger, "", "  ")
+		webFingerJSON = string(data)
+	}
+
+	// Render verification result
+	verifyTemplate.Execute(w, map[string]any{
+		"Domain":         result.Domain,
+		"Email":          result.Email,
+		"HasDNS":         result.HasDNS,
+		"HasHTTPS":       result.HasHTTPS,
+		"HasWebFinger":   result.HasWebFinger,
+		"WebFinger":      result.WebFinger,
+		"WebFingerJSON":  webFingerJSON,
+		"Issuer":         result.Issuer,
+		"ExpectedIssuer": result.ExpectedIssuer,
+		"Errors":         result.Errors,
+		"Warnings":       result.Warnings,
+	})
+}
+
+func (s *server) verifyDomain(ctx context.Context, domain, email string) *verificationResult {
+	result := &verificationResult{
+		Domain:         domain,
+		Email:          email,
+		ExpectedIssuer: s.issuer,
+	}
+
+	// Check DNS resolution
+	addrs, err := net.LookupHost(domain)
+	if err != nil || len(addrs) == 0 {
+		result.Errors = append(result.Errors, "DNS lookup failed: domain does not resolve")
+		return result
+	}
+	result.HasDNS = true
+
+	// Check HTTPS connectivity and WebFinger
+	webfingerURL := fmt.Sprintf("https://%s/.well-known/webfinger?resource=acct:%s", domain, url.QueryEscape(email))
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", webfingerURL, nil)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to create request: %v", err))
+		return result
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("HTTPS connection failed: %v", err))
+		return result
+	}
+	defer resp.Body.Close()
+
+	result.HasHTTPS = true
+
+	if resp.StatusCode != http.StatusOK {
+		result.Errors = append(result.Errors, fmt.Sprintf("WebFinger endpoint returned status %d", resp.StatusCode))
+		return result
+	}
+
+	// Parse WebFinger response
+	var wf webFingerResponse
+	if err := json.NewDecoder(resp.Body).Decode(&wf); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to parse WebFinger response: %v", err))
+		return result
+	}
+
+	result.HasWebFinger = true
+	result.WebFinger = &wf
+
+	// Look for OIDC issuer link
+	for _, link := range wf.Links {
+		if link.Rel == "http://openid.net/specs/connect/1.0/issuer" {
+			result.Issuer = link.Href
+			break
+		}
+	}
+
+	if result.Issuer == "" {
+		result.Errors = append(result.Errors, "WebFinger response is missing OIDC issuer link")
+	} else if result.Issuer != result.ExpectedIssuer {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("OIDC issuer (%s) differs from expected issuer (%s)", result.Issuer, result.ExpectedIssuer))
+	}
+
+	return result
 }
 
 func randomString(n int) string {
