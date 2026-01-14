@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"atlogin/testapp"
 	"github.com/bluesky-social/indigo/atproto/auth/oauth"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/tailscale/hujson"
@@ -105,9 +106,14 @@ func main() {
 		addr = ":9411"
 	}
 
+	// issuer can be empty - it will be dynamically set from the Host header
+	// However, OAuth config needs URLs at initialization time, so we use a placeholder
 	issuer := config.Issuer
-	if issuer == "" {
-		issuer = "https://at.apenwarr.ca"
+	oauthBaseURL := issuer
+	if oauthBaseURL == "" {
+		// Use a placeholder - the actual URLs will be dynamically constructed from Host header
+		// We can't leave this empty because OAuth library needs it at initialization
+		oauthBaseURL = "https://localhost:9411"
 	}
 
 	clientName := config.ClientName
@@ -121,8 +127,8 @@ func main() {
 	// Initialize ATProto OAuth client
 	// Use NewPublicConfig for production deployment with proper client metadata
 	oauthConfig := oauth.NewPublicConfig(
-		issuer+"/client-metadata.json",
-		issuer+"/atproto/callback",
+		oauthBaseURL+"/client-metadata.json",
+		oauthBaseURL+"/atproto/callback",
 		[]string{"atproto"},
 	)
 	oauthApp := oauth.NewClientApp(&oauthConfig, store)
@@ -139,8 +145,21 @@ func main() {
 		accessTokens: make(map[string]*authRequest),
 	}
 
+	// Create test app with the first client credentials from the config
+	var testAppClientID, testAppClientSecret string
+	for clientID, secret := range config.Secrets {
+		testAppClientID = clientID
+		testAppClientSecret = secret
+		break
+	}
+	testApp := testapp.NewServer(testAppClientID, testAppClientSecret, "")
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/{$}", serveRoot)
+
+	// Register test app handlers (includes root handler)
+	testApp.RegisterHandlers(mux)
+
+	// Register IDP handlers
 	mux.HandleFunc("/.well-known/webfinger", srv.serveWebFinger)
 	mux.HandleFunc("/helpers/webfinger", srv.serveWebFinger) // Stable helper endpoint for reverse proxying
 	mux.HandleFunc("/.well-known/openid-configuration", srv.serveOpenIDConfig)
@@ -173,11 +192,6 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
-}
-
-func serveRoot(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	io.WriteString(w, "Hello, this is the atlogin server.\n")
 }
 
 func ensureConfig(configPath string) error {
@@ -294,6 +308,23 @@ type atprotoSession struct {
 	nonce       string
 	oidcState   string // Original OIDC state parameter from Tailscale
 	createdAt   time.Time
+}
+
+// getIssuerURL returns the issuer URL, using the request's Host header if not configured
+func (s *idpServer) getIssuerURL(r *http.Request) string {
+	if s.issuer != "" {
+		return s.issuer
+	}
+	// Dynamically construct from the request
+	scheme := "https"
+	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+		scheme = "http"
+	}
+	host := r.Host
+	if host == "" {
+		host = "localhost:9411"
+	}
+	return scheme + "://" + host
 }
 
 // customAuthStore implements oauth.ClientAuthStore with custom OIDC session tracking
@@ -432,13 +463,15 @@ func (s *idpServer) serveWebFinger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	issuerURL := s.getIssuerURL(r)
+
 	w.Header().Set("Content-Type", "application/jrd+json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"subject": resource,
 		"links": []map[string]string{
 			{
 				"rel":  "http://openid.net/specs/connect/1.0/issuer",
-				"href": s.issuer,
+				"href": issuerURL,
 			},
 		},
 	})
@@ -452,12 +485,14 @@ func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	issuerURL := s.getIssuerURL(r)
+
 	json.NewEncoder(w).Encode(map[string]any{
-		"issuer":                                s.issuer,
-		"authorization_endpoint":                s.issuer + "/authorize",
-		"token_endpoint":                        s.issuer + "/token",
-		"userinfo_endpoint":                     s.issuer + "/userinfo",
-		"jwks_uri":                              s.issuer + "/.well-known/jwks.json",
+		"issuer":                                issuerURL,
+		"authorization_endpoint":                issuerURL + "/authorize",
+		"token_endpoint":                        issuerURL + "/token",
+		"userinfo_endpoint":                     issuerURL + "/userinfo",
+		"jwks_uri":                              issuerURL + "/.well-known/jwks.json",
 		"scopes_supported":                      []string{"openid", "profile", "email"},
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},
@@ -633,10 +668,21 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.mu.Unlock()
 
+	issuerURL := s.getIssuerURL(r)
+
 	// Default values if no ATProto session
 	userSub := "unknown"
 	userName := "Unknown User"
-	userEmail := "unknown@at.apenwarr.ca"
+	// Construct a default email using the request host
+	host := r.Host
+	if host == "" {
+		host = "localhost"
+	}
+	// Strip port if present
+	if colonPos := strings.Index(host, ":"); colonPos >= 0 {
+		host = host[:colonPos]
+	}
+	userEmail := "unknown@" + host
 
 	if sess != nil {
 		userSub = sess.did
@@ -646,7 +692,7 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	claims := map[string]any{
-		"iss":   s.issuer,
+		"iss":   issuerURL,
 		"sub":   userSub,
 		"aud":   clientID,
 		"exp":   now.Add(time.Hour).Unix(),
@@ -708,11 +754,21 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 
 	// If no ATProto session, return default values (for backwards compatibility)
 	if sess == nil {
+		// Construct a default email using the request host
+		host := r.Host
+		if host == "" {
+			host = "localhost"
+		}
+		// Strip port if present
+		if colonPos := strings.Index(host, ":"); colonPos >= 0 {
+			host = host[:colonPos]
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"sub":   "unknown",
 			"name":  "Unknown User",
-			"email": "unknown@at.apenwarr.ca",
+			"email": "unknown@" + host,
 		})
 		return
 	}
@@ -779,8 +835,9 @@ func (s *idpServer) serveClientMetadata(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Add custom client_name and client_uri
+	issuerURL := s.getIssuerURL(r)
 	metadataMap["client_name"] = s.clientName
-	metadataMap["client_uri"] = s.issuer
+	metadataMap["client_uri"] = issuerURL
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
