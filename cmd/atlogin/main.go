@@ -42,9 +42,10 @@ var (
 
 // Config represents the configuration file structure.
 type Config struct {
-	Addr    string            `json:"addr,omitempty"`
-	Issuer  string            `json:"issuer,omitempty"`
-	Secrets map[string]string `json:"secrets"`
+	Addr       string            `json:"addr,omitempty"`
+	Issuer     string            `json:"issuer,omitempty"`
+	ClientName string            `json:"client_name,omitempty"`
+	Secrets    map[string]string `json:"secrets"`
 }
 
 func main() {
@@ -109,6 +110,11 @@ func main() {
 		issuer = "https://at.apenwarr.ca"
 	}
 
+	clientName := config.ClientName
+	if clientName == "" {
+		clientName = "ATLogin"
+	}
+
 	// Initialize custom auth store for ATProto OAuth
 	store := newCustomAuthStore()
 
@@ -123,6 +129,7 @@ func main() {
 
 	srv := &idpServer{
 		issuer:       issuer,
+		clientName:   clientName,
 		secrets:      config.Secrets,
 		keyFile:      keyFile,
 		oauthApp:     oauthApp,
@@ -254,12 +261,13 @@ func addNewClient(configPath, clientID string) error {
 }
 
 type idpServer struct {
-	issuer    string
-	secrets   map[string]string // clientID -> clientSecret
-	keyFile   string
-	oauthApp  *oauth.ClientApp
-	oauthHost string // host for OAuth callback URL
-	store     *customAuthStore
+	issuer     string
+	clientName string
+	secrets    map[string]string // clientID -> clientSecret
+	keyFile    string
+	oauthApp   *oauth.ClientApp
+	oauthHost  string // host for OAuth callback URL
+	store      *customAuthStore
 
 	mu           sync.Mutex
 	signingKey   *signingKey
@@ -757,10 +765,27 @@ func (s *idpServer) serveClientMetadata(w http.ResponseWriter, r *http.Request) 
 	// Generate the OAuth client metadata document for ATProto OAuth
 	metadata := s.oauthApp.Config.ClientMetadata()
 
+	// Convert to map to add custom fields
+	var metadataMap map[string]any
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := json.Unmarshal(data, &metadataMap); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Add custom client_name and client_uri
+	metadataMap["client_name"] = s.clientName
+	metadataMap["client_uri"] = s.issuer
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 
-	if err := json.NewEncoder(w).Encode(metadata); err != nil {
+	if err := json.NewEncoder(w).Encode(metadataMap); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

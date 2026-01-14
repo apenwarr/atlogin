@@ -5,7 +5,12 @@
 	"addr": ":9411",
 
 	// Issuer URL for OIDC discovery. Must match what clients expect.
-	"issuer": "https://at.apenwarr.ca",
+	// Optional: defaults to "https://at.apenwarr.ca"
+	//"issuer": "https://at.apenwarr.ca",
+
+	// Friendly name shown on Bluesky authorization page.
+	// Optional: defaults to "ATLogin"
+	//"client_name": "ATLogin",
 
 	// OIDC client credentials. Map of client ID to client secret.
 	// Add new clients with: atlogin -new-client <client-id>
