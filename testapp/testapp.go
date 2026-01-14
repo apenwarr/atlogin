@@ -71,6 +71,7 @@ type webFingerLink struct {
 type verificationResult struct {
 	Domain         string
 	Email          string
+	ATProtoHandle  string
 	HasDNS         bool
 	HasHTTPS       bool
 	HasWebFinger   bool
@@ -79,6 +80,55 @@ type verificationResult struct {
 	ExpectedIssuer string
 	Errors         []string
 	Warnings       []string
+}
+
+// parseLoginHint extracts the ATProto handle and domain from a login hint.
+//
+// Format: user@domain
+//
+// ATProto handle rules:
+// 1. Default: user@domain -> @user.domain (ATProto handle), domain (webfinger domain)
+// 2. If "user." is a prefix of domain: user@user.example.com -> @user.example.com, user.example.com
+// 3. Special case for at.apenwarr.ca: user@at.apenwarr.ca -> @user, at.apenwarr.ca
+//
+// Examples:
+//   - at@apenwarr.ca -> @at.apenwarr.ca (handle), apenwarr.ca (domain)
+//   - apenwarr@apenwarr.ca -> @apenwarr.ca (handle), apenwarr.ca (domain)
+//   - user@at.apenwarr.ca -> @user (handle), at.apenwarr.ca (domain) [backward compat]
+//
+// Returns: (atprotoHandle, webfingerDomain, error)
+func parseLoginHint(loginHint string) (string, string, error) {
+	parts := strings.SplitN(loginHint, "@", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("expected format: user@domain, got: %s", loginHint)
+	}
+
+	user := parts[0]
+	domain := parts[1]
+
+	if user == "" {
+		return "", "", fmt.Errorf("user cannot be empty")
+	}
+
+	if domain == "" {
+		return "", "", fmt.Errorf("domain cannot be empty")
+	}
+
+	// Special case for backward compatibility with at.apenwarr.ca
+	if domain == "at.apenwarr.ca" {
+		return user, domain, nil
+	}
+
+	// Check if "user." is a prefix of domain
+	prefix := user + "."
+	if strings.HasPrefix(domain, prefix) {
+		// user@user.example.com -> @user.example.com
+		return domain, domain, nil
+	}
+
+	// Default case: user@domain -> @user.domain
+	atprotoHandle := user + "." + domain
+	return atprotoHandle, domain, nil
 }
 
 // NewServer creates a new test app server with the given credentials.
@@ -289,6 +339,9 @@ var verifyTemplate = template.Must(template.New("verify").Parse(`<!DOCTYPE html>
 
     <div class="section">
         <h2>Verification Checks</h2>
+        <div class="check-item">
+            <strong>ATProto username:</strong> @{{.ATProtoHandle}}
+        </div>
         <div class="check-item {{if .HasDNS}}check-pass{{else}}check-fail{{end}}">
             DNS resolution for {{.Domain}}
         </div>
@@ -400,11 +453,7 @@ ProxyPassReverse /.well-known/webfinger {{.ExpectedIssuer}}/helpers/webfinger</p
     <div class="section">
         <form action="/login" method="post" style="display: inline;">
             <input type="hidden" name="email" value="{{.Email}}">
-            {{if not .Errors}}
-            <button type="submit" class="button">Continue to Login</button>
-            {{else}}
-            <button type="submit" class="button" disabled title="Fix the errors above before continuing">Continue to Login</button>
-            {{end}}
+            <button type="submit" class="button">Login anyway</button>
         </form>
         <a href="/" class="button button-secondary">Start Over</a>
     </div>
@@ -766,19 +815,18 @@ func (s *Server) serveVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse email to extract domain
-	parts := strings.SplitN(email, "@", 2)
-	if len(parts) != 2 {
-		http.Error(w, "Invalid email format", http.StatusBadRequest)
+	// Parse email to get ATProto handle and webfinger domain
+	atprotoHandle, domain, err := parseLoginHint(email)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid email format: %v", err), http.StatusBadRequest)
 		return
 	}
-	domain := parts[1]
 
 	// Get issuer URL (use request host if not configured)
 	issuerURL := s.getIssuerURL(r)
 
 	// Verify the domain
-	result := s.verifyDomain(r.Context(), domain, email, issuerURL)
+	result := s.verifyDomain(r.Context(), domain, email, atprotoHandle, issuerURL)
 
 	// Pretty-print WebFinger JSON
 	var webFingerJSON string
@@ -791,6 +839,7 @@ func (s *Server) serveVerify(w http.ResponseWriter, r *http.Request) {
 	verifyTemplate.Execute(w, map[string]any{
 		"Domain":         result.Domain,
 		"Email":          result.Email,
+		"ATProtoHandle":  result.ATProtoHandle,
 		"HasDNS":         result.HasDNS,
 		"HasHTTPS":       result.HasHTTPS,
 		"HasWebFinger":   result.HasWebFinger,
@@ -803,11 +852,18 @@ func (s *Server) serveVerify(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) verifyDomain(ctx context.Context, domain, email, issuerURL string) *verificationResult {
+func (s *Server) verifyDomain(ctx context.Context, domain, email, atprotoHandle, issuerURL string) *verificationResult {
 	result := &verificationResult{
 		Domain:         domain,
 		Email:          email,
+		ATProtoHandle:  atprotoHandle,
 		ExpectedIssuer: issuerURL,
+	}
+
+	// Validate that ATProto handle contains a dot (unless it's the special at.apenwarr.ca case)
+	if !strings.Contains(atprotoHandle, ".") {
+		result.Errors = append(result.Errors, "ATProto accounts must contain a dot")
+		return result
 	}
 
 	// Check DNS resolution
