@@ -107,14 +107,7 @@ func main() {
 	}
 
 	// issuer can be empty - it will be dynamically set from the Host header
-	// However, OAuth config needs URLs at initialization time, so we use a placeholder
 	issuer := config.Issuer
-	oauthBaseURL := issuer
-	if oauthBaseURL == "" {
-		// Use a placeholder - the actual URLs will be dynamically constructed from Host header
-		// We can't leave this empty because OAuth library needs it at initialization
-		oauthBaseURL = "https://localhost:9411"
-	}
 
 	clientName := config.ClientName
 	if clientName == "" {
@@ -124,25 +117,15 @@ func main() {
 	// Initialize custom auth store for ATProto OAuth
 	store := newCustomAuthStore()
 
-	// Initialize ATProto OAuth client
-	// Use NewPublicConfig for production deployment with proper client metadata
-	oauthConfig := oauth.NewPublicConfig(
-		oauthBaseURL+"/client-metadata.json",
-		oauthBaseURL+"/atproto/callback",
-		[]string{"atproto"},
-	)
-	oauthApp := oauth.NewClientApp(&oauthConfig, store)
-
 	srv := &idpServer{
 		issuer:       issuer,
 		clientName:   clientName,
 		secrets:      config.Secrets,
 		keyFile:      keyFile,
-		oauthApp:     oauthApp,
-		oauthHost:    issuer,
 		store:        store,
 		codes:        make(map[string]*authRequest),
 		accessTokens: make(map[string]*authRequest),
+		oauthClients: make(map[string]*oauth.ClientApp),
 	}
 
 	// Create test app with the first client credentials from the config
@@ -280,14 +263,13 @@ type idpServer struct {
 	clientName string
 	secrets    map[string]string // clientID -> clientSecret
 	keyFile    string
-	oauthApp   *oauth.ClientApp
-	oauthHost  string // host for OAuth callback URL
 	store      *customAuthStore
 
 	mu           sync.Mutex
 	signingKey   *signingKey
 	codes        map[string]*authRequest
 	accessTokens map[string]*authRequest
+	oauthClients map[string]*oauth.ClientApp // issuerURL -> OAuth client (cached per host)
 }
 
 type authRequest struct {
@@ -325,6 +307,29 @@ func (s *idpServer) getIssuerURL(r *http.Request) string {
 		host = "localhost:9411"
 	}
 	return scheme + "://" + host
+}
+
+// getOrCreateOAuthClient returns an OAuth client for the given issuer URL,
+// creating it if it doesn't exist yet. This allows dynamic OAuth client
+// creation based on the request's Host header.
+func (s *idpServer) getOAuthClient(issuerURL string) *oauth.ClientApp {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if client, ok := s.oauthClients[issuerURL]; ok {
+		return client
+	}
+
+	// Create a new OAuth client for this issuer
+	oauthConfig := oauth.NewPublicConfig(
+		issuerURL+"/client-metadata.json",
+		issuerURL+"/atproto/callback",
+		[]string{"atproto"},
+	)
+	oauthApp := oauth.NewClientApp(&oauthConfig, s.store)
+	s.oauthClients[issuerURL] = oauthApp
+	log.Printf("Created ATProto OAuth client for issuer: %s", issuerURL)
+	return oauthApp
 }
 
 // customAuthStore implements oauth.ClientAuthStore with custom OIDC session tracking
@@ -551,11 +556,19 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get issuer URL from request Host header
+	issuerURL := s.getIssuerURL(r)
+
+	// Get or create OAuth client for this issuer
+	oauthApp := s.getOAuthClient(issuerURL)
+
 	// Start the ATProto OAuth flow
 	ctx := r.Context()
-	atprotoRedirectURL, err := s.oauthApp.StartAuthFlow(ctx, handle)
+	log.Printf("Starting ATProto OAuth flow for handle: %q (from login_hint: %q, domain: %q, issuer: %q)", handle, loginHint, domain, issuerURL)
+	atprotoRedirectURL, err := oauthApp.StartAuthFlow(ctx, handle)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to start ATProto OAuth flow: %v", err), http.StatusInternalServerError)
+		log.Printf("ATProto OAuth flow failed for handle %q: %v", handle, err)
+		http.Error(w, fmt.Sprintf("failed to start ATProto OAuth flow for handle @%s: %v\n\nThis usually means the ATProto account doesn't exist or isn't resolvable. Make sure the account exists on the ATProto network (e.g., Bluesky).", handle, err), http.StatusBadRequest)
 		return
 	}
 
@@ -845,8 +858,14 @@ func resolveHandleToDID(ctx context.Context, handle string) (string, error) {
 }
 
 func (s *idpServer) serveClientMetadata(w http.ResponseWriter, r *http.Request) {
+	// Get issuer URL from request Host header
+	issuerURL := s.getIssuerURL(r)
+
+	// Get or create OAuth client for this issuer
+	oauthApp := s.getOAuthClient(issuerURL)
+
 	// Generate the OAuth client metadata document for ATProto OAuth
-	metadata := s.oauthApp.Config.ClientMetadata()
+	metadata := oauthApp.Config.ClientMetadata()
 
 	// Convert to map to add custom fields
 	var metadataMap map[string]any
@@ -861,7 +880,6 @@ func (s *idpServer) serveClientMetadata(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Add custom client_name and client_uri
-	issuerURL := s.getIssuerURL(r)
 	metadataMap["client_name"] = s.clientName
 	metadataMap["client_uri"] = issuerURL
 
@@ -896,8 +914,14 @@ func (s *idpServer) serveATProtoCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Get issuer URL from request Host header
+	issuerURL := s.getIssuerURL(r)
+
+	// Get or create OAuth client for this issuer
+	oauthApp := s.getOAuthClient(issuerURL)
+
 	// Process the OAuth callback
-	sessData, err := s.oauthApp.ProcessCallback(ctx, r.URL.Query())
+	sessData, err := oauthApp.ProcessCallback(ctx, r.URL.Query())
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to process ATProto callback: %v", err), http.StatusInternalServerError)
 		return

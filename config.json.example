@@ -5,7 +5,7 @@
 	"addr": ":9411",
 
 	// Issuer URL for OIDC discovery. Must match what clients expect.
-	// Optional: defaults to "https://at.apenwarr.ca"
+	// Optional: will be dynamically determined from the Host header if not set.
 	//"issuer": "https://at.apenwarr.ca",
 
 	// Friendly name shown on Bluesky authorization page.
