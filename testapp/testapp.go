@@ -593,7 +593,11 @@ ProxyPassReverse /.well-known/webfinger {{.ExpectedIssuer}}/helpers/webfinger</p
     <div class="section">
         <form action="/login" method="post" style="display: inline;">
             <input type="hidden" name="email" value="{{.Email}}">
+            {{if or .Errors .Warnings}}
             <button type="submit" class="button">Login anyway</button>
+            {{else}}
+            <button type="submit" class="button">Login</button>
+            {{end}}
         </form>
         <a href="/" class="button button-secondary">Start Over</a>
     </div>
