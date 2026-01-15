@@ -89,12 +89,13 @@ type verificationResult struct {
 // ATProto handle rules:
 // 1. Default: user@domain -> @user.domain (ATProto handle), domain (webfinger domain)
 // 2. If "user." is a prefix of domain: user@user.example.com -> @user.example.com, user.example.com
-// 3. Special case for at.apenwarr.ca: user@at.apenwarr.ca -> @user, at.apenwarr.ca
+// 3. Special case for at.apenwarr.ca and atlogin.net: user@at.apenwarr.ca -> @user, at.apenwarr.ca
 //
 // Examples:
 //   - at@apenwarr.ca -> @at.apenwarr.ca (handle), apenwarr.ca (domain)
 //   - apenwarr@apenwarr.ca -> @apenwarr.ca (handle), apenwarr.ca (domain)
 //   - user@at.apenwarr.ca -> @user (handle), at.apenwarr.ca (domain) [backward compat]
+//   - user@atlogin.net -> @user (handle), atlogin.net (domain)
 //
 // Returns: (atprotoHandle, webfingerDomain, error)
 func parseLoginHint(loginHint string) (string, string, error) {
@@ -114,8 +115,8 @@ func parseLoginHint(loginHint string) (string, string, error) {
 		return "", "", fmt.Errorf("domain cannot be empty")
 	}
 
-	// Special case for backward compatibility with at.apenwarr.ca
-	if domain == "at.apenwarr.ca" {
+	// Special case for backward compatibility with at.apenwarr.ca and atlogin.net
+	if domain == "at.apenwarr.ca" || domain == "atlogin.net" {
 		return user, domain, nil
 	}
 
@@ -321,11 +322,11 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
             let atprotoHandle;
             let error = '';
 
-            // Special case for at.apenwarr.ca (backward compatibility)
-            if (domain === 'at.apenwarr.ca') {
+            // Special case for at.apenwarr.ca and atlogin.net (backward compatibility)
+            if (domain === 'at.apenwarr.ca' || domain === 'atlogin.net') {
                 atprotoHandle = '@' + user;
                 if (!user.includes('.')) {
-                    error = ' ⚠️ Warning: ATProto handles must contain a dot (except legacy at.apenwarr.ca)';
+                    error = ' ⚠️ Warning: ATProto handles must contain a dot ';
                 }
             }
             // Check if "user." is a prefix of domain
@@ -338,7 +339,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
             }
 
             // Validate that the handle contains a dot (unless it's the special case)
-            if (domain !== 'at.apenwarr.ca' && !atprotoHandle.substring(1).includes('.')) {
+            if (domain !== 'at.apenwarr.ca' && domain !== 'atlogin.net' && !atprotoHandle.substring(1).includes('.')) {
                 error = ' ⚠️ Invalid: ATProto handles must contain a dot';
             }
 
@@ -1036,7 +1037,7 @@ func (s *Server) verifyDomain(ctx context.Context, domain, email, atprotoHandle,
 		ExpectedIssuer: issuerURL,
 	}
 
-	// Validate that ATProto handle contains a dot (unless it's the special at.apenwarr.ca case)
+	// Validate that ATProto handle contains a dot (unless it's the special at.apenwarr.ca/atlogin.net case)
 	if !strings.Contains(atprotoHandle, ".") {
 		result.Errors = append(result.Errors, "ATProto accounts must contain a dot")
 		return result

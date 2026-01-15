@@ -654,12 +654,13 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 // ATProto handle rules:
 // 1. Default: user@domain -> @user.domain (ATProto handle), domain (webfinger domain)
 // 2. If "user." is a prefix of domain: user@user.example.com -> @user.example.com, user.example.com
-// 3. Special case for at.apenwarr.ca: user@at.apenwarr.ca -> @user, at.apenwarr.ca
+// 3. Special case for at.apenwarr.ca and atlogin.net: user@at.apenwarr.ca -> @user, at.apenwarr.ca
 //
 // Examples:
 //   - at@apenwarr.ca -> @at.apenwarr.ca (handle), apenwarr.ca (domain)
 //   - apenwarr@apenwarr.ca -> @apenwarr.ca (handle), apenwarr.ca (domain)
 //   - user@at.apenwarr.ca -> @user (handle), at.apenwarr.ca (domain) [backward compat]
+//   - user@atlogin.net -> @user (handle), atlogin.net (domain)
 //
 // Returns: (atprotoHandle, webfingerDomain, error)
 func parseLoginHint(loginHint string) (string, string, error) {
@@ -679,8 +680,8 @@ func parseLoginHint(loginHint string) (string, string, error) {
 		return "", "", fmt.Errorf("domain cannot be empty")
 	}
 
-	// Special case for backward compatibility with at.apenwarr.ca
-	if domain == "at.apenwarr.ca" {
+	// Special case for backward compatibility with at.apenwarr.ca and atlogin.net
+	if domain == "at.apenwarr.ca" || domain == "atlogin.net" {
 		return user, domain, nil
 	}
 
