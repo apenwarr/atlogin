@@ -1243,11 +1243,21 @@ func (s *idpServer) serveGenerateClient(w http.ResponseWriter, r *http.Request) 
 		appName = "app"
 	}
 
-	// Use the user's handle as the identifier (clean up for use in client_id)
-	// Remove @ symbol and dots to make it URL-safe
-	userID := strings.ReplaceAll(strings.ReplaceAll(user.handle, "@", ""), ".", "-")
+	// Use the user's email (which includes both handle and domain) as the identifier
+	// This ensures different login methods (apenwarr.ca@atlogin.net vs apenwarr@apenwarr.ca)
+	// produce different client_ids and therefore different secrets
+	// Encoding scheme to avoid collisions:
+	// - Replace "-" with "--" (escape existing hyphens first)
+	// - Replace "@" with "-at-"
+	// - Replace "." with "-"
+	// This way "a-b@c" and "a.b@c" produce different results
+	userID := user.email
+	userID = strings.ReplaceAll(userID, "-", "--")  // Escape hyphens first
+	userID = strings.ReplaceAll(userID, "@", "-at-")
+	userID = strings.ReplaceAll(userID, ".", "-")
 
 	// Generate client_id and client_secret
+	// Format: <email-encoded>-<appname>-v1
 	clientID := fmt.Sprintf("%s-%s-v1", userID, appName)
 	clientSecret := s.generateClientSecret(clientID)
 
