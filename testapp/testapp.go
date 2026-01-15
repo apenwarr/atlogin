@@ -510,6 +510,30 @@ var resultTemplate = template.Must(template.New("result").Parse(`<!DOCTYPE html>
         .back-link:hover {
             background-color: #0056b3;
         }
+        .generate-client-btn {
+            display: inline-block;
+            margin-top: 20px;
+            margin-left: 10px;
+            padding: 10px 20px;
+            background-color: #28a745;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+        }
+        .generate-client-btn:hover {
+            background-color: #218838;
+        }
+        .client-section {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 4px;
+        }
+        .client-section h2 {
+            margin-top: 0;
+            color: #856404;
+        }
     </style>
 </head>
 <body>
@@ -537,6 +561,12 @@ var resultTemplate = template.Must(template.New("result").Parse(`<!DOCTYPE html>
     <div class="section">
         <h2>Token Response</h2>
         <pre>{{.TokenResponseJSON}}</pre>
+    </div>
+
+    <div class="client-section">
+        <h2>Generate OIDC Client Credentials</h2>
+        <p>Now that you've verified your identity, you can generate client credentials for your applications.</p>
+        <a href="/generate-client" class="generate-client-btn">Generate Client Credentials</a>
     </div>
 
     <a href="/" class="back-link">Test Again</a>
@@ -702,6 +732,13 @@ func (s *Server) serveCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get user info: %v", err), http.StatusInternalServerError)
 		return
+	}
+
+	// Create authenticated session for client generation
+	if err = s.createAuthSession(ctx, issuerURL, tokenResp.AccessToken, w); err != nil {
+		// Log but don't fail - user can still see their auth result
+		// They just won't be able to generate clients without re-authenticating
+		fmt.Fprintf(w, "<!-- Warning: Failed to create session: %v -->\n", err)
 	}
 
 	// Pretty-print JSON
@@ -932,6 +969,34 @@ func (s *Server) verifyDomain(ctx context.Context, domain, email, atprotoHandle,
 	}
 
 	return result
+}
+
+func (s *Server) createAuthSession(ctx context.Context, issuerURL, accessToken string, w http.ResponseWriter) error {
+	sessionURL := strings.TrimSuffix(issuerURL, "/") + "/create-session"
+
+	req, err := http.NewRequestWithContext(ctx, "POST", sessionURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, body)
+	}
+
+	// Copy session cookies from the response to the client
+	for _, cookie := range resp.Cookies() {
+		http.SetCookie(w, cookie)
+	}
+
+	return nil
 }
 
 func randomString(n int) string {

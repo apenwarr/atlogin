@@ -6,8 +6,10 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -46,6 +48,7 @@ type Config struct {
 	Addr       string            `json:"addr,omitempty"`
 	Issuer     string            `json:"issuer,omitempty"`
 	ClientName string            `json:"client_name,omitempty"`
+	MasterKey  string            `json:"master_key,omitempty"`
 	Secrets    map[string]string `json:"secrets"`
 }
 
@@ -97,6 +100,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Ensure master_key exists, generate if empty
+	if config.MasterKey == "" {
+		config.MasterKey = randomHex(32)
+		if err := saveConfig(configPath, config); err != nil {
+			log.Fatalf("cannot save config with generated master_key: %v", err)
+		}
+		log.Printf("Generated and saved master_key to config")
+	}
+
 	if len(config.Secrets) == 0 {
 		log.Fatal("config must have at least one client in secrets")
 	}
@@ -121,6 +133,8 @@ func main() {
 		issuer:       issuer,
 		clientName:   clientName,
 		secrets:      config.Secrets,
+		masterKey:    config.MasterKey,
+		configPath:   configPath,
 		keyFile:      keyFile,
 		store:        store,
 		codes:        make(map[string]*authRequest),
@@ -152,6 +166,8 @@ func main() {
 	mux.HandleFunc("/userinfo", srv.serveUserInfo)
 	mux.HandleFunc("/atproto/callback", srv.serveATProtoCallback)
 	mux.HandleFunc("/client-metadata.json", srv.serveClientMetadata)
+	mux.HandleFunc("/create-session", srv.serveCreateSession)
+	mux.HandleFunc("/generate-client", srv.serveGenerateClient)
 
 	log.Printf("Starting OIDC server at %s (issuer: %s)", addr, issuer)
 	log.Fatal(http.ListenAndServe(addr, mux))
@@ -175,6 +191,24 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+func saveConfig(configPath string, config *Config) error {
+	data, err := json.MarshalIndent(config, "", "\t")
+	if err != nil {
+		return fmt.Errorf("cannot marshal config: %v", err)
+	}
+	data = append(data, '\n')
+
+	tmpFile := configPath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+		return fmt.Errorf("cannot write temp config file: %v", err)
+	}
+	if err := os.Rename(tmpFile, configPath); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("cannot rename config file: %v", err)
+	}
+	return nil
 }
 
 func ensureConfig(configPath string) error {
@@ -262,6 +296,8 @@ type idpServer struct {
 	issuer     string
 	clientName string
 	secrets    map[string]string // clientID -> clientSecret
+	masterKey  string
+	configPath string
 	keyFile    string
 	store      *customAuthStore
 
@@ -332,6 +368,13 @@ func (s *idpServer) getOAuthClient(issuerURL string) *oauth.ClientApp {
 	return oauthApp
 }
 
+type verifiedUser struct {
+	did        string
+	handle     string
+	email      string
+	verifiedAt time.Time
+}
+
 // customAuthStore implements oauth.ClientAuthStore with custom OIDC session tracking
 type customAuthStore struct {
 	mu       sync.Mutex
@@ -339,15 +382,21 @@ type customAuthStore struct {
 	requests map[string]*oauth.AuthRequestData
 	// Map ATProto state to OIDC session info
 	oidcSessions map[string]*atprotoSession
+	// Track verified users for client generation (DID -> user info)
+	verifiedUsers map[string]*verifiedUser
+	// Map session ID (from cookie) to user DID for authentication
+	sessionIDToUser map[string]string // sessionID -> DID
 	// Track the most recently created state for linking
 	lastState string
 }
 
 func newCustomAuthStore() *customAuthStore {
 	return &customAuthStore{
-		sessions:     make(map[string]*oauth.ClientSessionData),
-		requests:     make(map[string]*oauth.AuthRequestData),
-		oidcSessions: make(map[string]*atprotoSession),
+		sessions:        make(map[string]*oauth.ClientSessionData),
+		requests:        make(map[string]*oauth.AuthRequestData),
+		oidcSessions:    make(map[string]*atprotoSession),
+		verifiedUsers:   make(map[string]*verifiedUser),
+		sessionIDToUser: make(map[string]string),
 	}
 }
 
@@ -950,6 +999,14 @@ func (s *idpServer) serveATProtoCallback(w http.ResponseWriter, r *http.Request)
 	if matchedSession.email == "" {
 		matchedSession.email = matchedSession.handle + "@" + matchedSession.domain
 	}
+
+	// Store the verified session for client generation (use DID as key)
+	s.store.verifiedUsers[authenticatedDID] = &verifiedUser{
+		did:       authenticatedDID,
+		handle:    matchedSession.handle,
+		email:     matchedSession.email,
+		verifiedAt: time.Now(),
+	}
 	s.store.mu.Unlock()
 
 	// Generate an authorization code for the OIDC flow
@@ -974,6 +1031,362 @@ func (s *idpServer) serveATProtoCallback(w http.ResponseWriter, r *http.Request)
 	u.RawQuery = uq.Encode()
 
 	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+func (s *idpServer) serveCreateSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Verify the request has a valid Bearer token from /userinfo
+	auth := r.Header.Get("Authorization")
+	if len(auth) < 8 || auth[:7] != "Bearer " {
+		http.Error(w, "Missing or invalid authorization header", http.StatusUnauthorized)
+		return
+	}
+	token := auth[7:]
+
+	// Validate the access token and get the user info
+	s.mu.Lock()
+	ar, ok := s.accessTokens[token]
+	s.mu.Unlock()
+
+	if !ok || ar.validTill.Before(time.Now()) {
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	// Get the verified user from the ATProto session
+	s.store.mu.Lock()
+	var user *verifiedUser
+	if ar.atprotoState != "" {
+		sess := s.store.oidcSessions[ar.atprotoState]
+		if sess != nil {
+			user = s.store.verifiedUsers[sess.did]
+		}
+	}
+	s.store.mu.Unlock()
+
+	if user == nil {
+		http.Error(w, "User not found or not verified", http.StatusUnauthorized)
+		return
+	}
+
+	// Generate a session ID
+	sessionID := randomHex(32)
+
+	// Store the session
+	s.store.mu.Lock()
+	s.store.sessionIDToUser[sessionID] = user.did
+	s.store.mu.Unlock()
+
+	// Set a session cookie (valid for 1 hour)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "atlogin_session",
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   3600, // 1 hour
+	})
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Session created"))
+}
+
+func (s *idpServer) serveGenerateClient(w http.ResponseWriter, r *http.Request) {
+	// Check for valid session cookie
+	cookie, err := r.Cookie("atlogin_session")
+	if err != nil {
+		http.Error(w, "Unauthorized: Please log in first", http.StatusUnauthorized)
+		return
+	}
+
+	// Validate session and get user
+	s.store.mu.Lock()
+	did, ok := s.store.sessionIDToUser[cookie.Value]
+	var user *verifiedUser
+	if ok {
+		user = s.store.verifiedUsers[did]
+	}
+	s.store.mu.Unlock()
+
+	if user == nil {
+		http.Error(w, "Unauthorized: Invalid or expired session", http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method == "GET" {
+		// Show the form
+		html := `<!DOCTYPE html>
+<html>
+<head>
+    <title>Generate OIDC Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        .info {
+            background-color: #e7f3ff;
+            border: 1px solid #b3d9ff;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin: 20px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-size: 16px;
+        }
+        button {
+            margin-top: 10px;
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .result {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+            padding: 20px;
+            border-radius: 4px;
+            margin-top: 20px;
+        }
+        .result h2 {
+            margin-top: 0;
+        }
+        .credential {
+            background-color: #f5f5f5;
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-family: monospace;
+            word-break: break-all;
+        }
+        .label {
+            font-weight: bold;
+            color: #555;
+        }
+        .link {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 4px;
+        }
+        .link a {
+            color: #856404;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Generate OIDC Client Configuration</h1>
+    <div class="info">
+        After logging in and verifying your identity, you can generate OIDC client credentials to use with your applications.
+    </div>
+    <form method="POST">
+        <div class="form-group">
+            <label for="app_name">Application Name:</label>
+            <input type="text" id="app_name" name="app_name" value="Tailscale" required>
+        </div>
+        <button type="submit">Generate Client Credentials</button>
+    </form>
+</body>
+</html>`
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(html))
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse form
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+		return
+	}
+
+	appName := r.FormValue("app_name")
+	if appName == "" {
+		appName = "app"
+	}
+
+	// Use the user's handle as the identifier (clean up for use in client_id)
+	// Remove @ symbol and dots to make it URL-safe
+	userID := strings.ReplaceAll(strings.ReplaceAll(user.handle, "@", ""), ".", "-")
+
+	// Generate client_id and client_secret
+	clientID := fmt.Sprintf("%s-%s-v1", userID, appName)
+	clientSecret := s.generateClientSecret(clientID)
+
+	// Add to config
+	s.mu.Lock()
+	s.secrets[clientID] = clientSecret
+	s.mu.Unlock()
+
+	// Save config to disk
+	config, err := loadConfig(s.configPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to load config: %v", err), http.StatusInternalServerError)
+		return
+	}
+	config.Secrets[clientID] = clientSecret
+	if err := saveConfig(s.configPath, config); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save config: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Prepare result HTML
+	issuerURL := s.getIssuerURL(r)
+	resultHTML := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+    <title>OIDC Client Generated</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        .result {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+            padding: 20px;
+            border-radius: 4px;
+            margin-top: 20px;
+        }
+        .result h2 {
+            margin-top: 0;
+        }
+        .credential {
+            background-color: #f5f5f5;
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-family: monospace;
+            word-break: break-all;
+        }
+        .label {
+            font-weight: bold;
+            color: #555;
+            display: block;
+            margin-bottom: 5px;
+        }
+        .link {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 4px;
+        }
+        .link a {
+            color: #856404;
+            font-weight: bold;
+        }
+        .instructions {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e7f3ff;
+            border: 1px solid #b3d9ff;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>OIDC Client Configuration Generated</h1>
+    <div class="result">
+        <h2>Client Credentials</h2>
+        <p>Copy these credentials and paste them into your application:</p>
+
+        <div class="credential">
+            <span class="label">App Name:</span>
+            %s
+        </div>
+
+        <div class="credential">
+            <span class="label">Client ID:</span>
+            %s
+        </div>
+
+        <div class="credential">
+            <span class="label">Client Secret:</span>
+            %s
+        </div>
+
+        <div class="credential">
+            <span class="label">Issuer URL:</span>
+            %s
+        </div>
+    </div>`, appName, clientID, clientSecret, issuerURL)
+
+	// Add Tailscale link if app name is Tailscale
+	if appName == "Tailscale" {
+		resultHTML += `
+    <div class="link">
+        <strong>Tailscale Setup:</strong><br>
+        Configure your custom OIDC provider at: <a href="https://login.tailscale.com/start/oidc" target="_blank">https://login.tailscale.com/start/oidc</a>
+    </div>`
+	}
+
+	resultHTML += `
+    <div class="instructions">
+        <h3>Next Steps:</h3>
+        <ol>
+            <li>Copy the Client ID and Client Secret above</li>
+            <li>Configure your application with these credentials</li>
+            <li>Set the Issuer URL to: <code>` + issuerURL + `</code></li>
+            <li>When users log in, they should use the format: <code>handle@domain</code></li>
+        </ol>
+    </div>
+</body>
+</html>`
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(resultHTML))
+}
+
+func (s *idpServer) generateClientSecret(clientID string) string {
+	// Generate client_secret using HMAC-SHA256 of client_id with master_key
+	h := hmac.New(sha256.New, []byte(s.masterKey))
+	h.Write([]byte(clientID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
 // Signing key helpers
