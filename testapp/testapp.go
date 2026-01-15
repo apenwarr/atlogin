@@ -152,16 +152,38 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux) {
 var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 <html>
 <head>
-    <title>ATLogin Test App</title>
+    <title>ATLogin - OIDC for ATProto/Bluesky</title>
     <style>
         body {
             font-family: Arial, sans-serif;
-            max-width: 600px;
+            max-width: 700px;
             margin: 50px auto;
             padding: 20px;
+            line-height: 1.6;
         }
         h1 {
+            color: #1d4ed8;
+            margin-bottom: 10px;
+        }
+        h2 {
             color: #333;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 2px solid #e5e7eb;
+        }
+        .subtitle {
+            color: #666;
+            font-size: 18px;
+            margin-bottom: 30px;
+        }
+        .intro {
+            background-color: #eff6ff;
+            border-left: 4px solid #1d4ed8;
+            padding: 15px;
+            margin-bottom: 30px;
+        }
+        .intro p {
+            margin: 10px 0;
         }
         form {
             margin: 20px 0;
@@ -197,19 +219,136 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
             font-size: 14px;
             margin-top: 5px;
         }
+        .preview {
+            margin-top: 15px;
+            padding: 12px;
+            background-color: #f9fafb;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-family: monospace;
+            min-height: 24px;
+        }
+        .preview-label {
+            font-size: 13px;
+            font-weight: bold;
+            color: #374151;
+            margin-bottom: 5px;
+        }
+        .preview-handle {
+            color: #1d4ed8;
+            font-size: 16px;
+        }
+        .preview-error {
+            color: #dc2626;
+            font-size: 14px;
+        }
+        .features {
+            background-color: #f0fdf4;
+            border-left: 4px solid #10b981;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .features ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
     </style>
 </head>
 <body>
-    <h1>ATLogin Test App</h1>
-    <p>Enter your desired email address to test the ATLogin OIDC flow.</p>
+    <h1>ATLogin</h1>
+    <div class="subtitle">OpenID Connect Identity Provider for ATProto (Bluesky) Accounts</div>
+
+    <div class="intro">
+        <p><strong>ATLogin</strong> lets you use your ATProto/Bluesky identity to log in to any application that supports OIDC.</p>
+        <p>Use your Bluesky handle as your email address for seamless authentication across services.</p>
+    </div>
+
+    <div class="features">
+        <strong>What you can do:</strong>
+        <ul>
+            <li>Log in to OIDC-compatible apps with your Bluesky identity</li>
+            <li>Generate client credentials for your own applications</li>
+            <li>Use any domain with ATProto handle verification</li>
+        </ul>
+    </div>
+
+    <h2>Set Up ATProto Login for Your Domain</h2>
+    <p>Test the ATLogin OIDC flow and verify your domain is configured correctly.</p>
 
     <form action="/verify" method="post">
-        <label for="email">Email Address:</label>
+        <label for="email">Email Address (Your ATProto Identity):</label>
         <input type="email" id="email" name="email" required
-               placeholder="{{.ExampleEmail}}">
-        <div class="help">Format: handle@domain (e.g., {{.ExampleEmail}})</div>
-        <button type="submit">Log In with ATLogin</button>
+               placeholder="{{.ExampleEmail}}" oninput="updatePreview()">
+        <div class="help">Format: handle@domain (e.g., {{.ExampleEmail}} or username@bsky.social)</div>
+
+        <div class="preview-label">Your ATProto handle is:</div>
+        <div class="preview" id="preview">
+            <span class="preview-handle" id="preview-handle"></span>
+            <span class="preview-error" id="preview-error"></span>
+        </div>
+
+        <button type="submit">Verify Domain & Test Login</button>
     </form>
+
+    <script>
+        function updatePreview() {
+            const input = document.getElementById('email').value;
+            const previewHandle = document.getElementById('preview-handle');
+            const previewError = document.getElementById('preview-error');
+
+            if (!input) {
+                previewHandle.textContent = '';
+                previewError.textContent = '';
+                return;
+            }
+
+            const parts = input.split('@');
+            if (parts.length !== 2) {
+                previewHandle.textContent = '';
+                previewError.textContent = 'Invalid format: use handle@domain';
+                return;
+            }
+
+            const user = parts[0];
+            const domain = parts[1];
+
+            if (!user || !domain) {
+                previewHandle.textContent = '';
+                previewError.textContent = 'Both handle and domain are required';
+                return;
+            }
+
+            let atprotoHandle;
+            let error = '';
+
+            // Special case for at.apenwarr.ca (backward compatibility)
+            if (domain === 'at.apenwarr.ca') {
+                atprotoHandle = '@' + user;
+                if (!user.includes('.')) {
+                    error = ' ⚠️ Warning: ATProto handles must contain a dot (except legacy at.apenwarr.ca)';
+                }
+            }
+            // Check if "user." is a prefix of domain
+            else if (domain.startsWith(user + '.')) {
+                atprotoHandle = '@' + domain;
+            }
+            // Default case: user@domain -> @user.domain
+            else {
+                atprotoHandle = '@' + user + '.' + domain;
+            }
+
+            // Validate that the handle contains a dot (unless it's the special case)
+            if (domain !== 'at.apenwarr.ca' && !atprotoHandle.substring(1).includes('.')) {
+                error = ' ⚠️ Invalid: ATProto handles must contain a dot';
+            }
+
+            previewHandle.textContent = atprotoHandle;
+            previewError.textContent = error;
+        }
+
+        // Initialize preview on page load
+        updatePreview();
+    </script>
 </body>
 </html>
 `))
