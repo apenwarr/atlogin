@@ -634,7 +634,8 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Store the OIDC request info mapped to the ATProto state
 	s.store.oidcSessions[atprotoState] = &atprotoSession{
 		handle:      handle,
-		domain:      domain, // Store the original domain from login_hint
+		domain:      domain,    // Store the original domain from login_hint
+		email:       loginHint, // The email is exactly what the user typed
 		clientID:    clientID,
 		redirectURI: redirectURI,
 		nonce:       q.Get("nonce"),
@@ -995,8 +996,8 @@ func (s *idpServer) serveATProtoCallback(w http.ResponseWriter, r *http.Request)
 	s.store.mu.Lock()
 	matchedSession.did = authenticatedDID
 
-	// Construct email to match the original login_hint format
-	// User logged in as "handle@domain", so we return "handle@domain"
+	// Email should already be set from the original login_hint.
+	// This fallback is for legacy sessions that don't have it set.
 	if matchedSession.email == "" {
 		matchedSession.email = matchedSession.handle + "@" + matchedSession.domain
 	}
