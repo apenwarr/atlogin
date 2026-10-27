@@ -17,6 +17,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
@@ -102,6 +103,9 @@ func main() {
 
 	// Ensure master_key exists, generate if empty
 	if config.MasterKey == "" {
+		if os.Getenv("ATLOGIN_CONFIG") != "" {
+			log.Printf("WARNING: ATLOGIN_CONFIG has no master_key, so secrets from /generate-client will change on every restart. Add the generated master_key to it.")
+		}
 		config.MasterKey = randomHex(32)
 		if err := saveConfig(configPath, config); err != nil {
 			log.Fatalf("cannot save config with generated master_key: %v", err)
@@ -579,7 +583,7 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	clientID := q.Get("client_id")
-	if _, ok := s.secrets[clientID]; !ok {
+	if _, ok := s.clientSecret(clientID); !ok {
 		http.Error(w, "invalid client_id", http.StatusBadRequest)
 		return
 	}
@@ -594,7 +598,12 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Expected format: hello.example.com@any.domain
 	loginHint := q.Get("login_hint")
 	if loginHint == "" {
-		http.Error(w, "missing login_hint parameter (expected format: handle@domain)", http.StatusBadRequest)
+		// login_hint is optional in OIDC, and some clients (e.g. Keycloak)
+		// never send one, so ask the user for it instead.
+		w.Header().Set("Content-Type", "text/html")
+		if err := loginHintForm.Execute(w, q); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 
@@ -647,6 +656,31 @@ func (s *idpServer) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Redirect the user to the ATProto OAuth authorization endpoint
 	http.Redirect(w, r, atprotoRedirectURL, http.StatusFound)
 }
+
+// loginHintForm asks for the login when /authorize has no login_hint, and
+// resubmits the original OIDC parameters along with it.
+var loginHintForm = template.Must(template.New("login_hint").Parse(`<!DOCTYPE html>
+<html>
+<head>
+    <title>Log in</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+        input[type="text"] { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 16px; }
+        button { margin-top: 10px; padding: 10px 20px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+    </style>
+</head>
+<body>
+    <h1>Log in</h1>
+    <form method="GET" action="/authorize">
+{{- range $k, $vs := .}}{{if ne $k "login_hint"}}{{range $vs}}
+        <input type="hidden" name="{{$k}}" value="{{.}}">
+{{- end}}{{end}}{{end}}
+        <label for="login_hint">Login, as <code>handle@domain</code> (e.g. <code>alice.bsky.social@atlogin.net</code>):</label>
+        <input type="text" id="login_hint" name="login_hint" required autofocus>
+        <button type="submit">Continue</button>
+    </form>
+</body>
+</html>`))
 
 // parseLoginHint extracts the ATProto handle and domain from a login hint.
 //
@@ -706,12 +740,14 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 
 	// Validate client credentials
 	clientID, clientSecret, ok := r.BasicAuth()
-	if !ok {
+	if ok {
+		clientID, clientSecret = s.unescapeBasicAuth(clientID, clientSecret)
+	} else {
 		clientID = r.FormValue("client_id")
 		clientSecret = r.FormValue("client_secret")
 	}
-	expectedSecret, ok := s.secrets[clientID]
-	if !ok || clientSecret != expectedSecret {
+	expectedSecret, ok := s.clientSecret(clientID)
+	if !ok || !hmac.Equal([]byte(clientSecret), []byte(expectedSecret)) {
 		http.Error(w, "invalid client credentials", http.StatusUnauthorized)
 		return
 	}
@@ -1392,6 +1428,47 @@ func (s *idpServer) serveGenerateClient(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(resultHTML))
+}
+
+// clientSecret returns the secret for clientID. Clients made by
+// /generate-client don't have to be in s.secrets, since their secret is
+// HMAC(master_key, client_id): that way they keep working after a restart
+// (which rewrites config.json from ATLOGIN_CONFIG) and on other machines,
+// as long as master_key stays the same.
+func (s *idpServer) clientSecret(clientID string) (string, bool) {
+	s.mu.Lock()
+	secret, ok := s.secrets[clientID]
+	s.mu.Unlock()
+	if ok {
+		return secret, true
+	}
+	if isGeneratedClientID(clientID) {
+		return s.generateClientSecret(clientID), true
+	}
+	return "", false
+}
+
+// isGeneratedClientID reports whether clientID looks like one from
+// serveGenerateClient: <encoded email, which contains "-at-">-<app>-v1.
+func isGeneratedClientID(clientID string) bool {
+	return strings.Contains(clientID, "-at-") && strings.HasSuffix(clientID, "-v1")
+}
+
+// unescapeBasicAuth undoes the form-encoding that RFC 6749 section 2.3.1
+// requires for HTTP Basic client credentials (Keycloak and
+// golang.org/x/oauth2 do it; many clients don't). Generated secrets are
+// base64 with "+", "/" and "=", so it matters. Raw values win if they match.
+func (s *idpServer) unescapeBasicAuth(clientID, clientSecret string) (string, string) {
+	if want, ok := s.clientSecret(clientID); ok && hmac.Equal([]byte(clientSecret), []byte(want)) {
+		return clientID, clientSecret
+	}
+	if id, err := url.QueryUnescape(clientID); err == nil {
+		clientID = id
+	}
+	if secret, err := url.QueryUnescape(clientSecret); err == nil {
+		clientSecret = secret
+	}
+	return clientID, clientSecret
 }
 
 func (s *idpServer) generateClientSecret(clientID string) string {
